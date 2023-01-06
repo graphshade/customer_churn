@@ -1,0 +1,636 @@
+---
+title: "ISP Churn Project"
+author: "Elvis Agbenyega"
+output:
+  html_document:
+    df_print: paged
+    toc: true
+---
+
+
+# Load Libraries 
+
+```{r, warning=FALSE, message=FALSE}
+
+library(tidyverse)
+library(tidymodels)
+library(janitor)
+library(skimr)
+library(kableExtra)
+library(GGally)
+library(kableExtra) # -- make nice looking resutls when we knitt 
+library(vip)        # --  tidymodels variable importance
+library(fastshap)   # -- shapley values for variable importance 
+library(MASS)
+library(DataExplorer)
+library(rpart.plot)
+library(ggthemes)
+library(corrplot)
+```
+
+***
+
+# Data Preparation
+
+## Import Data
+
+```{r}
+
+# - - - - - Import dataset and convert categorical variables - - - - -
+
+churn_df <- readr::read_csv("./data/Churn_training.csv", 
+                               col_types = cols(.default = "?",
+                                      ip_address_asn = col_character(),
+                                      phone_area_code = col_character(),
+                                      senior_citizen = col_character(),
+                                      churn = col_character())) %>% clean_names()
+
+#churn_df <- readr::read_csv("./data/Churn_training.csv") %>% clean_names()
+
+
+head(churn_df) 
+```
+## Profile Data and Deal with Missing Values
+
+### Dealing with missing values
+
+Data has some missing values. Strategy is to impute missing numeric predictors using median
+
+```{r}
+
+churn_df %>% plot_intro( ggtheme = theme_clean())
+
+```
+
+# Exploratory Analysis
+
+## Investigate Class Imbalance
+
+From the output below, the target variable has class imbalance ratio of 1:20. Thus, the minority event (churn) occurs 1 out of 20 times.
+
+**Implications**
+
+This imbalance means that a putative classifier build to estimate the most frequent event (no churn) will have an accuracy of 95%. Hence accuracy will not be a good evaluation metric for this project. Evaluation metrics like Recall and F-measure may be better measures.
+
+**Strategy to deal with imbalance**
+
+1. Do stratified train-test split so that the training dataset distribution is the same as the test dataset distribution
+2. Use metrics that less prone to class imbalance considering our business context like precision, F-measure, Precision-Recall Area Under Curve for model evaluation
+
+```{r,warning=FALSE}
+
+churn_sum <- churn_df %>%
+  count(churn) %>%
+  mutate(pct = n/sum(n))
+
+churn_sum
+
+churn_sum %>%
+  ggplot(aes(x=churn,y=pct)) +
+  geom_col()  + 
+  scale_y_continuous(labels = label_percent()) + 
+  geom_text(aes(label = paste(round(100*pct,2), "%", sep = "")) , vjust = 1.5, colour = "white" ) +
+  labs(title="Churn", x="Churn", y="PCT")
+```
+
+
+## Investigate the churn problem
+churn has increased from 2019 to 2020
+
+```{r}
+churn_df %>% na.omit() %>%
+  mutate(period = lubridate::year(customer_reg_date)) %>% 
+  group_by(period, churn) %>%
+  summarize(n=n()) %>%
+  ungroup() %>%
+  mutate(pct = round(n/sum(n) *100,0)) %>% 
+  write_csv("./results/churn_rates_overtime.csv")
+  
+```
+
+## Explore numerical variables
+
+### Box plots of numerical variables by enrollment
+
+```{r}
+
+churn_df %>%
+ select_if(is.numeric) %>% names() -> num_cols
+
+churn_df[,append(num_cols,"churn")] %>% 
+  plot_boxplot(by="churn", ncol=2L,ggtheme = ggthemes::theme_clean())
+```
+
+>*Observations from the boxplots:* churn is somewhat influence by numeric values such as monthly_minutes, prev_balance, streaming_minutes, totalled_billed, number_phones
+
+
+## Explore categorical variables
+
+## Pairwise stack column charts to investigate visually whether some categorical variables explain churn
+
+```{r}
+
+chr_col_deselect <- c("billing_city", "billing_postal", "customer_id", "billing_address", "ip_address_asn", "phone_area_code",
+                      "device_protection", "contract_code")
+
+char_explore <- function(col){
+  churn_df  %>% na.omit() %>% 
+    ggplot(., aes(!!as.name(col))) + 
+    geom_bar(aes(fill = churn), position = "fill") +
+    scale_fill_grey(start = 0.6, end = 0.2) + 
+    coord_flip() + 
+    labs(title = col,
+         y = "proportion",
+         x="")
+}
+
+# -- for each character column if it doesnt equal customer id then create a chart
+
+for (column in names(churn_df %>% select_if(is_character) %>% dplyr::select(-one_of(chr_col_deselect)))){
+  
+    chrt <- char_explore(column)
+    print(chrt)
+}
+
+```
+
+
+
+## Model Building
+
+
+### 1. Data Prep
+
+```{r}
+
+data_prep <- function(data){
+  return(data %>%  mutate_if(is.character, factor))}
+
+churn_prep <- data_prep(churn_df)
+```
+
+
+### 2. 70/30 Stratified train-test split
+
+```{r}
+# -- set a random seed for repeatablity 
+set.seed(123)
+
+# -- performs stratified our train / test split 
+churn_split <- initial_split(churn_prep, prop = 0.7, strata = churn)
+
+# -- extract the training data 
+churn_train<- training(churn_split)
+# -- extract the test data 
+churn_test <- testing(churn_split)
+
+sprintf("Train PCT : %1.2f%%", nrow(churn_train)/ nrow(churn_prep) * 100)
+
+# training set proportions by class
+churn_train %>%
+  group_by(churn) %>%
+  summarize(n=n()) %>%
+  ungroup() %>%
+  mutate(pct = n/sum(n))
+
+sprintf("Test  PCT : %1.2f%%", nrow(churn_test)/ nrow(churn_prep) * 100)
+
+# test set proportions by class
+churn_test %>%
+  group_by(churn) %>%
+  summarize(n=n()) %>%
+  ungroup() %>%
+  mutate(pct = n/sum(n))
+```
+
+
+
+#### 3. Recipe
+
+```{r}
+# -- create our recipe -- 
+churn_recipe <- recipe(churn ~ email_domain + streaming_plan + mobile_hotspot + online_backup + currency_code + 
+                   maling_code + paperless_billing + payment_method  + network_speed + monthly_minutes + 
+                   customer_service_calls + streaming_minutes+total_billed + prev_balance + late_payments + number_phones
+                   , data = churn_train) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_unknown(all_nominal_predictors()) %>%
+  step_scale(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors())
+churn_recipe
+```
+### 4. Bake recipe
+
+```{r}
+bake_train <- bake(churn_recipe %>% prep(), new_data = churn_train)
+bake_test <- bake(churn_recipe %>% prep(), new_data = churn_test)
+
+```
+
+
+
+### 5. Model evaluation strategy
+
+```{r}
+#function to predict given model and threshold
+predict_set <- function(workflow_fit, dataset, threshold = 0.5){
+  scored <- predict(workflow_fit, dataset, type="prob") %>% 
+    mutate(.pred_class = as.factor(ifelse(.pred_1>=threshold, 1,0))) %>% 
+    bind_cols(.,dataset)
+  return(scored)}
+
+
+#function to evaluate model and compute model gain
+evaluate_set <- function(scored_data, model_name, datasplit = "training", event_label = "churn", event_level="second"){
+  
+  multi_metric <- metric_set(accuracy, precision, recall, pr_auc, roc_auc)
+
+  tot_actual_pos = nrow(scored_data[scored_data[event_label] == 1,])  #scored_data %>% dplyr::select(!!as.name(event_label))
+  print(tot_actual_pos)
+  tot_pred_pos = nrow(scored_data[scored_data[".pred_class"] == 1,]) #scored_data %>% dplyr::select(.pred_class)
+    print(tot_pred_pos)
+  scored_data %>% 
+    multi_metric(truth = !!as.name(event_label), 
+            predicted = .pred_1, 
+            estimate = .pred_class,
+            event_level = event_level) %>%
+    mutate(datasplit=datasplit,
+           model_name = model_name) %>% 
+    pivot_wider(names_from = .metric, values_from=.estimate) %>% 
+    mutate(loss_without_mod = tot_actual_pos * -1200,
+           loss_false_neg = (1-recall)*tot_actual_pos *-50,
+           loss_false_pos = (1-precision)*tot_pred_pos *-1200,
+           gain_true_pos = recall * tot_actual_pos * 500,
+           model_gain = loss_false_neg + loss_false_pos + gain_true_pos,
+           cost_saving_pct = round((model_gain/loss_without_mod)*-100,2)) -> eval
+return(eval)}
+```
+
+
+### 6. Model building
+
+#### Model 1: Simple logistic regression using Lasso
+
+```{r,warning=FALSE}
+#Model specification
+lasso_spec <- logistic_reg(penalty = 0.01, mixture = 1) %>%
+  set_mode("classification") %>%
+  set_engine("glmnet")
+
+#Model workflow
+lasso_workflow <- workflow() %>%
+  add_recipe(churn_recipe) %>%
+  add_model(lasso_spec) %>%
+  fit(churn_train)
+
+
+#Model prediction
+scored_train_lasso <- predict_set(workflow_fit = lasso_workflow, dataset = churn_train, threshold = 0.5)
+scored_test_lasso <- predict_set(workflow_fit = lasso_workflow, dataset = churn_test, threshold = 0.5)
+
+
+#Model Evaluation
+eval_metrics_train_lasso <- evaluate_set(scored_data = scored_train_lasso, 
+                                         model_name = "Logistic Regression - Lasso", 
+                                         datasplit = "training dataset", 
+                                         event_label = "churn",
+                                         event_level = "second")
+
+eval_metrics_test_lasso <- evaluate_set(scored_data = scored_test_lasso, 
+                                         model_name = "Logistic Regression - Lasso", 
+                                         datasplit = "testing dataset", 
+                                         event_label = "churn",
+                                         event_level = "second")
+
+eval_metrics_full_lasso <- eval_metrics_train_lasso %>% 
+  bind_rows(eval_metrics_test_lasso)
+
+eval_metrics_full_lasso
+
+#Variable Importance
+lasso_workflow %>%
+ pull_workflow_fit() %>%
+  tidy() %>%
+  mutate_if(is.numeric,round,2)
+
+lasso_workflow %>%
+  pull_workflow_fit() %>%
+  vip(20)
+
+
+
+```
+
+
+
+#### Model 2: KNN
+
+##### Model fitting using cross validation to select optimal value for the neighbors parameter (K)
+
+```{r, eval=FALSE}
+#Tune specification for KNN
+tune_spec_knn <- nearest_neighbor(neighbors = tune()) %>%
+  set_mode("classification") %>%
+  set_engine("kknn")
+
+#Tune workflow
+tune_wf_knn <- workflow() %>%
+  add_recipe(churn_recipe) %>%
+  add_model(tune_spec_knn)
+
+#vfold samples
+set.seed(234)
+trees_folds <- vfold_cv(churn_train)
+
+#enable parallel processing
+doParallel::registerDoParallel()
+
+#set up grid
+knn_grid <- grid_random(
+  neighbors(),
+  size = 5)
+
+knn_grid
+
+#tune
+set.seed(456)
+tune_knn_res <- tune_grid(
+  tune_wf_knn,
+  resamples = trees_folds,
+  grid = knn_grid
+)
+
+tune_knn_res
+
+
+#view metrics
+tune_knn_res%>%
+  collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  mutate(k = as.factor(neighbors)) %>%
+  ggplot(aes(k, mean)) +
+  geom_line(alpha = 0.5, size = 1.5) +
+  geom_point() +
+  labs(y = "AUC")
+
+#select best parameters
+best_auc_knn <- select_best(tune_knn_res, "roc_auc")
+
+#select best model for KNN
+final_knn <- finalize_model(
+  tune_spec_knn,
+  best_auc_knn
+)
+
+final_knn
+
+#final workflow for KNN
+final_knn_wf <- workflow() %>%
+  add_recipe(churn_recipe) %>%
+  add_model(final_knn)
+
+
+#final model for KNN
+final_knn_model <- final_knn_wf %>%
+  fit(churn_train)
+
+saveRDS(final_knn_model,"./models/final_knn_model_k10.rds")
+
+#metrics
+final_knn_model %>%
+  collect_metrics()
+
+```
+
+##### KNN Model predictions
+
+```{r}
+final_knn_model <- readRDS("./final_knn_model_k10.rds")
+scored_train_knn <- predict_set(final_knn_model, churn_train)
+scored_test_knn <- predict_set(final_knn_model, churn_test)
+
+write_csv(scored_train_knn, "./results/scored_train_knn.csv")
+write_csv(scored_test_knn, "./results/scored_test_knn.csv")
+
+eval_metrics_train_knn <- evaluate_set(scored_train_knn,model_name = "KNN_K10", datasplit = "training")
+eval_metrics_test_knn <- evaluate_set(scored_test_knn,model_name = "KNN_K10", datasplit = "testing")
+
+eval_metrics_full_knn <- eval_metrics_train_knn %>% 
+  bind_rows(eval_metrics_test_knn)
+eval_metrics_full_knn
+
+```
+
+
+#### Model 3: Random Forest
+
+##### Model fitting using cross validation to select optimal value for mtry, min_n,
+
+```{r, eval=FALSE}
+
+#Tune specification of rand_forest
+set.seed(456)
+rf_tune_spec <- rand_forest(
+  mtry = tune(),
+  trees = 500 ,
+  min_n = tune()) %>%
+  set_mode("classification") %>%
+  set_engine("ranger", importance = "impurity")
+
+#workflow
+rf_tune_wf <- workflow() %>%
+  add_recipe(churn_recipe) %>%
+  add_model(rf_tune_spec)
+
+#vfold samples
+set.seed(234)
+trees_folds <- vfold_cv(churn_train, v=3)
+
+#enable parallel processing
+doParallel::registerDoParallel(cores = 3)
+
+#set up grid  
+set.seed(456)
+rf_grid <- grid_random(
+  mtry(range(3,5)),
+  min_n(),
+  size = 10)
+
+rf_grid
+
+#tune
+set.seed(456)
+regular_res <- tune_grid(
+  rf_tune_wf,
+  resamples = trees_folds,
+  grid = rf_grid
+)
+
+regular_res
+
+#view metrics
+regular_res %>%
+  collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  mutate(min_n = factor(min_n)) %>%
+  ggplot(aes(mtry, mean, color = min_n)) +
+  geom_line(alpha = 0.5, size = 1.5) +
+  geom_point() +
+  labs(y = "AUC")
+
+
+#select best parameters
+best_auc <- select_best(regular_res, "roc_auc")
+
+#select best model
+final_rf <- finalize_model(
+  rf_tune_spec,
+  best_auc
+)
+
+final_rf
+
+#final workflow
+final_rf_wf_tuned <- workflow() %>%
+  add_recipe(churn_recipe) %>%
+  add_model(final_rf) %>% 
+  fit(churn_train)
+  
+
+saveRDS(final_rf_wf_tuned, "./models/rand_forest_final_tune.rds")
+
+#Variable Importance
+final_rf_wf_tuned %>%
+  pull_workflow_fit() %>%
+  vip()
+
+```
+
+##### Random Forest Model predictions
+
+```{r}
+rf_wf <- readRDS("./rand_forest_final_tune.rds")
+scored_train_rf <- predict_set(rf_wf, churn_train)
+scored_test_rf <- predict_set(rf_wf, churn_test)
+
+write_csv(scored_train_rf, "./results/scored_train_rf.csv")
+write_csv(scored_test_rf, "./results/scored_test_rf.csv")
+
+eval_metrics_train_rf <- evaluate_set(scored_train_rf,model_name = "Random forest", datasplit = "training")
+eval_metrics_test_rf <- evaluate_set(scored_test_rf,model_name = "random forest", datasplit = "testing")
+
+eval_metrics_full_rf <- eval_metrics_train_rf %>% 
+  bind_rows(eval_metrics_test_rf)
+eval_metrics_full_rf
+
+```
+
+
+#### Confusion Matrix
+
+```{r}
+scored_train_lasso %>%
+  conf_mat(churn, .pred_class) %>%
+  autoplot( type = "heatmap") +
+  labs(title="Train Confusion Matrix")
+
+scored_test_lasso %>%
+  conf_mat(churn, .pred_class) %>%
+  autoplot( type = "heatmap") +
+  labs(title="Test Confusion Matrix")
+
+scored_train_knn %>%
+  conf_mat(churn, .pred_class) %>%
+  autoplot( type = "heatmap") +
+  labs(title="Train Confusion Matrix")
+
+scored_test_knn %>%
+  conf_mat(churn, .pred_class) %>%
+  autoplot( type = "heatmap") +
+  labs(title="Test Confusion Matrix")
+
+scored_train_rf %>%
+  conf_mat(churn, .pred_class) %>%
+  autoplot( type = "heatmap") +
+  labs(title="Train Confusion Matrix")
+
+scored_test_rf %>%
+  conf_mat(churn, .pred_class) %>%
+  autoplot( type = "heatmap") +
+  labs(title="Test Confusion Matrix")
+
+
+
+```
+
+
+
+
+## Kaggle predictions
+
+### Read hold out dataset
+
+```{r}
+churn_holdout <- readr::read_csv("./data/Churn_holdout.csv", 
+                               col_types = cols(.default = "?",
+                                      ip_address_asn = col_character(),
+                                      phone_area_code = col_character(),
+                                      senior_citizen = col_character())) %>% clean_names()
+
+
+churn_holdout <- data_prep(churn_holdout)
+```
+
+
+### Logistic Model predictions for Kaggle
+
+```{r}
+scored_holdout_lasso <- predict_set(lasso_workflow, churn_holdout)
+
+scored_holdout_lasso %>% 
+  dplyr::select(customer_id, .pred_class) %>% 
+  rename(churn=.pred_class) %>% 
+  write_csv( "./results/kaggle_lasso.csv")
+
+```
+
+
+
+### KNN Model predictions for Kaggle
+
+```{r}
+
+scored_holdout_knn <- predict_set(final_knn_model, churn_holdout)
+
+scored_holdout_knn %>% 
+  dplyr::select(customer_id, .pred_class) %>% 
+  rename(churn=.pred_class) %>% 
+  write_csv( "./results/kaggle_knn.csv")
+
+```
+
+### Random Forest Model predictions for Kaggle
+```{r}
+scored_holdout_rf <- predict_set(rf_wf, churn_holdout)
+
+scored_holdout_rf %>% dplyr::select(customer_id, .pred_class) %>% 
+write_csv( "./results/kaggle_random_forest.csv")
+
+```
+
+```{r, eval=FALSE}
+
+eval_metrics_full_rf %>% write_csv("./results/eval_metrics_full_rf.csv")
+
+eval_metrics_full_knn %>% write_csv("./results/eval_metrics_full_knn.csv")
+
+eval_metrics_full_lasso %>% write_csv("./results/eval_metrics_full_lasso.csv")
+
+
+
+```
+
+
+
+
+
